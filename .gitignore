@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node / frontend build
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+*.tsbuildinfo
+node_modules/
+
+# Runtime data and secrets (never commit)
+.env
+.env.local
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
