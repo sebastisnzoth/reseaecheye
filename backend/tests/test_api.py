@@ -90,3 +90,19 @@ def test_public_search_verified_response(monkeypatch):
     detail=client.get(f"/api/investigations/{item['id']}",headers=HEAD).json()
     assert len(detail["external_results"])==1
     client.delete(f"/api/investigations/{item['id']}",headers=HEAD)
+
+def test_crop_compare_scene_features():
+    import numpy as np
+    rng=np.random.default_rng(42)
+    pixels=rng.integers(0,256,size=(500,500),dtype=np.uint8)
+    original=Image.fromarray(pixels).convert("RGB")
+    cropped=original.crop((90,70,430,410))
+    aa=io.BytesIO();bb=io.BytesIO()
+    original.save(aa,format="PNG");cropped.save(bb,format="PNG")
+    r=client.post("/api/compare",headers=HEAD,files={"first":("a.png",aa.getvalue(),"image/png"),
+                                                       "second":("b.png",bb.getvalue(),"image/png")})
+    assert r.status_code==200
+    result=r.json()
+    assert result["exact"] is False
+    assert result["possibly_same_scene"] is True
+    assert result["feature_inliers"]>=10

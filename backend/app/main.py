@@ -23,6 +23,7 @@ from fastapi.responses import Response
 from PIL import Image, ImageOps, ImageChops, ImageEnhance, UnidentifiedImageError
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import simpleSplit
 
 DATA = Path(os.getenv("DATA_DIR", "./data")).resolve()
 MAX_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "10485760"))
@@ -228,6 +229,29 @@ def report_pdf(item_id:str):
         pdf.drawImage(ImageReader(im.convert("RGB")),48,110,width=im.width*min(440/im.width,300/im.height),
                       height=im.height*min(440/im.width,300/im.height))
     except Exception: pass
+    public_items=public["external_results"]
+    if public_items:
+        pdf.showPage()
+        pdf.setFont("Helvetica-Bold",15)
+        pdf.drawString(48,797,"Wikimedia Commons: exact SHA-1 file matches")
+        y=763
+        for i,match in enumerate(public_items,1):
+            if y < 115:
+                pdf.showPage();y=790
+            pdf.setFont("Helvetica-Bold",10)
+            for line in simpleSplit(f"{i}. {match.get('title','Untitled')}", "Helvetica-Bold",10,495):
+                pdf.drawString(48,y,line);y-=15
+            pdf.setFont("Helvetica",9)
+            for line in simpleSplit(f"Source: {match.get('page_url','')}", "Helvetica",9,490):
+                pdf.drawString(48,y,line);y-=14
+            try:
+                pdf.linkURL(match["page_url"],(48,y,545,y+32),relative=0)
+            except Exception: pass
+            pdf.drawString(48,y,f"Last uploaded: {match.get('published_at') or 'UNKNOWN'}; original appearance: UNKNOWN")
+            y-=34
+        if y < 90: pdf.showPage();y=790
+        pdf.setFont("Helvetica",9)
+        pdf.drawString(48,y,"Evidence: provider SHA-1 lookup; links require independent verification.")
     pdf.showPage();pdf.save()
     return Response(buf.getvalue(),media_type="application/pdf",
         headers={"Content-Disposition":f'attachment; filename="imagetrace-{item_id}.pdf"',"Cache-Control":"no-store"})
@@ -256,7 +280,33 @@ async def compare(first:UploadFile=File(...),second:UploadFile=File(...)):
     tint=Image.new("RGB",size,(255,72,90))
     heatmap=Image.composite(tint,ia,mask.point(lambda p: 125 if p else 0))
     out=io.BytesIO();heatmap.save(out,format="PNG")
-    return {"pixel_change_fraction":altered,"pixel_method":"absolute grayscale difference > 30/255 after aspect-preserving padding; sensitive to alignment/compression",
+    # ORB keypoints with geometric verification: robust to some crops/rotations/scales.
+    feature_matches=0;feature_inliers=0;possibly_same_scene=False
+    try:
+        import cv2
+        import numpy as np
+        gray_a=np.asarray(ImageOps.exif_transpose(Image.open(io.BytesIO(a))).convert("L"))
+        gray_b=np.asarray(ImageOps.exif_transpose(Image.open(io.BytesIO(b))).convert("L"))
+        orb=cv2.ORB_create(nfeatures=1400)
+        kp_a,desc_a=orb.detectAndCompute(gray_a,None)
+        kp_b,desc_b=orb.detectAndCompute(gray_b,None)
+        if desc_a is not None and desc_b is not None:
+            candidate=cv2.BFMatcher(cv2.NORM_HAMMING,crossCheck=True).match(desc_a,desc_b)
+            good=[m for m in candidate if m.distance < 58]
+            feature_matches=len(good)
+            if feature_matches >= 8:
+                src=np.float32([kp_a[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+                dst=np.float32([kp_b[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+                _,mask_h=cv2.findHomography(src,dst,cv2.RANSAC,5.0)
+                if mask_h is not None:
+                    feature_inliers=int(mask_h.sum())
+                    possibly_same_scene=feature_inliers>=10 and feature_inliers/max(feature_matches,1)>=0.45
+    except (ImportError,ValueError,cv2.error) if "cv2" in locals() else (ImportError,ValueError):
+        pass
+    return {"feature_matches":feature_matches,"feature_inliers":feature_inliers,
+            "possibly_same_scene":possibly_same_scene,
+            "feature_note":"ORB keypoint homography is an indicative visual match only; not identity or proof of editing",
+            "pixel_change_fraction":altered,"pixel_method":"absolute grayscale difference > 30/255 after aspect-preserving padding; sensitive to alignment/compression",
             "difference_preview_png_base64":base64.b64encode(out.getvalue()).decode(),
             "exact":sha_a==sha_b,"sha256":[sha_a,sha_b],
             "phash":[p_a,p_b],"phash_distance":int(imagehash.hex_to_hash(p_a)-imagehash.hex_to_hash(p_b)),
