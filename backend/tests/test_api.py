@@ -106,3 +106,23 @@ def test_crop_compare_scene_features():
     assert result["exact"] is False
     assert result["possibly_same_scene"] is True
     assert result["feature_inliers"]>=10
+
+def test_reverse_requires_auth_and_empty_results():
+    item=add().json()
+    path=f"/api/investigations/{item['id']}/reverse"
+    assert client.get(path).status_code == 401
+    response=client.get(path,headers=HEAD)
+    assert response.status_code == 200
+    result=response.json()
+    assert result["scope"] == "private_upload_index_only"
+    assert result["no_public_identity_search"] is True
+    assert result["searched_records"] >= 0
+    assert result["external"]["external_results"] == []
+
+def test_reverse_exact_duplicate():
+    a=add().json()
+    b=add().json()
+    result=client.get(f"/api/investigations/{b['id']}/reverse",headers=HEAD).json()
+    assert any(m["id"] == a["id"] and m["verified_exact"]
+               and m["match_type"] == "exact_bytes" for m in result["matches"])
+    assert all(m["source_url"] is None for m in result["matches"])
