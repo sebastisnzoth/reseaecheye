@@ -123,7 +123,7 @@ def matches(item):
         rows = db.execute("SELECT * FROM investigations WHERE id != ? ORDER BY created_at DESC LIMIT 500", (item["id"],)).fetchall()
     output = []
     for row in rows:
-        distance = imagehash.hex_to_hash(item["phash"]) - imagehash.hex_to_hash(row["phash"])
+        distance = int(imagehash.hex_to_hash(item["phash"]) - imagehash.hex_to_hash(row["phash"]))
         exact = row["sha256"] == item["sha256"]
         if exact or distance <= 10:
             output.append({"id":row["id"],"filename":row["filename"],"type":"exact" if exact else "visual_similarity",
@@ -241,7 +241,7 @@ async def compare(first:UploadFile=File(...),second:UploadFile=File(...)):
     return {"pixel_change_fraction":altered,"pixel_method":"absolute grayscale difference > 30/255 after aspect-preserving padding; sensitive to alignment/compression",
             "difference_preview_png_base64":base64.b64encode(out.getvalue()).decode(),
             "exact":sha_a==sha_b,"sha256":[sha_a,sha_b],
-            "phash":[p_a,p_b],"phash_distance":imagehash.hex_to_hash(p_a)-imagehash.hex_to_hash(p_b),
+            "phash":[p_a,p_b],"phash_distance":int(imagehash.hex_to_hash(p_a)-imagehash.hex_to_hash(p_b)),
             "dimensions":[[meta_a["width"],meta_a["height"]],[meta_b["width"],meta_b["height"]]],
             "note":"Hamming distance, not forensic proof; cropping may change hashes."}
 
