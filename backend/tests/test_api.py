@@ -46,7 +46,7 @@ def test_compare():
 
 def test_external_results_not_invented():
     r=add().json()
-    assert r["external_results"]==[] and r["external_status"]=="not_configured"
+    assert r["external_results"]==[] and r["external_status"]=="not_checked"
     assert client.post("/api/analyze-url",headers=HEAD).status_code==501
 
 def test_public_search_failed_provider_not_fake(monkeypatch):
