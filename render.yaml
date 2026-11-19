@@ -1,0 +1,17 @@
+# Render Free blueprint (no credit card required for Hobby/Free instances).
+# NOTE: the Free filesystem is ephemeral; SQLite data is lost on restart/spin-down.
+services:
+  - type: web
+    name: imagetrace-osint
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: IMAGETRACE_SECRET_KEY
+        generateValue: true
+      - key: IMAGETRACE_EXTERNAL_PROVIDERS
+        value: "true"
+      - key: IMAGETRACE_RETENTION_HOURS
+        value: "24"
+      - key: IMAGETRACE_CORS_ORIGINS
+        value: ""
