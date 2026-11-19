@@ -4,6 +4,8 @@ import io
 import json
 import os
 import secrets
+import base64
+import threading
 import sqlite3
 import time
 import uuid
@@ -17,7 +19,7 @@ import imagehash
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageChops, ImageEnhance, UnidentifiedImageError
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
@@ -27,6 +29,9 @@ RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "24"))
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 DATA.mkdir(parents=True, exist_ok=True)
 DB = DATA / "imagetrace.sqlite3"
+_rate_lock = threading.Lock()
+_rate_window: dict[str, list[float]] = {}
+
 app = FastAPI(title="ImageTrace OSINT", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET","POST","DELETE"], allow_headers=["X-API-Key","Content-Type"])
 
@@ -45,13 +50,22 @@ def migrate():
 
 migrate()
 
-def authorize(x_api_key: str | None = Header(default=None)):
+def authorize(request: Request, x_api_key: str | None = Header(default=None)):
     key = os.getenv("APP_API_KEY", "")
     # Fail closed until operator sets a secret; never expose results publicly.
     if len(key) < 16:
         raise HTTPException(503, "APP_API_KEY must be set (at least 16 characters)")
     if not x_api_key or not secrets.compare_digest(key, x_api_key):
         raise HTTPException(401, "Unauthorized")
+    if request.method == "POST":
+        now = time.monotonic()
+        identity = hashlib.sha256(x_api_key.encode()).hexdigest()
+        with _rate_lock:
+            history = [t for t in _rate_window.get(identity, []) if now-t < 60]
+            if len(history) >= 20:
+                raise HTTPException(429, "Too many processing requests; retry in one minute")
+            history.append(now)
+            _rate_window[identity] = history
 
 def cleanup():
     limit = time.time() - max(1, RETENTION_HOURS) * 3600
@@ -212,7 +226,21 @@ def delete(item_id:str):
 async def compare(first:UploadFile=File(...),second:UploadFile=File(...)):
     a=await first.read(MAX_BYTES+1);b=await second.read(MAX_BYTES+1)
     sha_a,p_a,meta_a=analyze(a);sha_b,p_b,meta_b=analyze(b)
-    return {"exact":sha_a==sha_b,"sha256":[sha_a,sha_b],
+    # Align dimensions for an orientative visual change map. Pixel ratio is not a tampering score.
+    ia=ImageOps.exif_transpose(Image.open(io.BytesIO(a))).convert("RGB")
+    ib=ImageOps.exif_transpose(Image.open(io.BytesIO(b))).convert("RGB")
+    size=(min(768,max(ia.width,ib.width)), min(768,max(ia.height,ib.height)))
+    ia=ImageOps.pad(ia,size,color=(0,0,0)); ib=ImageOps.pad(ib,size,color=(0,0,0))
+    diff=ImageChops.difference(ia,ib)
+    mask=diff.convert("L").point(lambda p: 255 if p > 30 else 0)
+    mask_pixels=mask.histogram()
+    altered=round(mask_pixels[255] / (size[0]*size[1]), 4)
+    tint=Image.new("RGB",size,(255,72,90))
+    heatmap=Image.composite(tint,ia,mask.point(lambda p: 125 if p else 0))
+    out=io.BytesIO();heatmap.save(out,format="PNG")
+    return {"pixel_change_fraction":altered,"pixel_method":"absolute grayscale difference > 30/255 after aspect-preserving padding; sensitive to alignment/compression",
+            "difference_preview_png_base64":base64.b64encode(out.getvalue()).decode(),
+            "exact":sha_a==sha_b,"sha256":[sha_a,sha_b],
             "phash":[p_a,p_b],"phash_distance":imagehash.hex_to_hash(p_a)-imagehash.hex_to_hash(p_b),
             "dimensions":[[meta_a["width"],meta_a["height"]],[meta_b["width"],meta_b["height"]]],
             "note":"Hamming distance, not forensic proof; cropping may change hashes."}
