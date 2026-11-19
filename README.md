@@ -152,3 +152,15 @@ Resumen de pendientes honestos: búsqueda inversa global real (requiere proveedo
 **Entrega:** repositorio documentado, app web funcional, backend operativo, SQLite con migraciones, integraciones reales disponibles, 19 pruebas automatizadas, `.env.example` sin credenciales, instrucciones de instalación, opciones de despliegue gratuito verificadas e informe de limitaciones.
 
 Licencia MIT. Creado con fines de investigación responsable de imágenes **públicas**; respete derechos de autor, privacidad y condiciones de acceso de cada plataforma.
+
+---
+
+## 9. Nota de integración con `main` (implementación previa)
+
+`main` incorporó dos commits de un MVP local-first anterior (`8107224`, `ca80514`) mientras esta rama estaba abierta. Al integrarlos se conservó **toda la historia** y se tomaron estas decisiones explícitas:
+
+- La implementación activa es la de esta rama (6 proveedores, URLs firmadas con vencimiento, 19 pruebas, informes PDF/JSON de 10 secciones).
+- Se conservan y adaptan el workflow de CI (`.github/workflows/ci.yml`, ahora contra `requirements.txt` y `pytest.ini` de la raíz) y la investigación `docs/GITHUB_OPEN_SOURCE_RESEARCH.md`.
+- Los archivos incompatibles del MVP anterior (API con `X-API-Key`, `/api/analyze`, `/api/compare`, y sus pruebas) se archivan **sin borrarlos** en `docs/legacy-mvp/`, fuera de `testpaths`, para que la suite actual siga siendo verde. Ver `docs/legacy-mvp/README.md`.
+- Proveedores: la consulta exacta por SHA-1 en la API oficial de Wikimedia (`list=allimages&aisha1`) está documentada en [MediaWiki API:Allimages](https://www.mediawiki.org/wiki/API:Allimages); la política de User-Agent en [Wikimedia APIs/Access policy](https://www.mediawiki.org/wiki/Wikimedia_APIs/Access_policy). Nuestra integración usa `generator=search` + `prop=imageinfo` y verificación local de candidatos, y nunca atribuye una URL pública a un ítem del índice privado.
+- Aquella evaluación desplegada en Vercel/Render era de un **único operador** con clave compartida y disco efímero; esta versión agrega aislamiento por token de propietario, firmas con vencimiento y retención. Sigue sin ser un SaaS público multiusuario.
