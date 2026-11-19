@@ -7,19 +7,22 @@ A privacy-conscious, local-first image investigation application: React + TypeSc
 - SHA-256 exact-match detection; 64-bit perceptual pHash similarity comparison across the private uploaded index (distance ≤10; not a statistical confidence percentage).
 - Safe EXIF subset, dimensions, optional OCR if Tesseract executable is installed; GPS coordinates intentionally never returned.
 - Single-user API-key-protected history, JSON/PDF reports, delete on demand, automatic cleanup after 24 hours on API activity.
-- Two-image comparison of SHA-256 and pHash; manual Google Lens / TinEye links that do not auto-upload user data.
+- Two-image comparison of SHA-256, pHash, OpenCV ORB crop/scene features, pixel difference map, before/after slider and overlay transparency.
+- Opt-in exact SHA-1 lookup in Wikimedia Commons' official MediaWiki API. Only the hash is transmitted; matching uploaded files are linked to their Commons description pages. Provider upload date is not necessarily original publication date.
+- Manual Google Lens / TinEye links that do not auto-upload user data.
 - Spanish, Brazilian Portuguese and English UI.
 
 ## Important limitations
-- **NOT** a whole-Internet reverse image search. Public matches are always empty until an official permitted provider is connected. Manual links are not search results.
+- **NOT** a whole-Internet reverse image search. The authorized Wikimedia Commons connector finds only byte-identical current-version Commons files. Other public sources and visually transformed internet copies are not indexed. Manual links are not search results.
 - URL ingestion intentionally returns HTTP 501: resolving remote URLs securely needs DNS pinning, allowed schemes, streaming byte limits, verified redirects, and SSRF tests.
-- No cropped-image detection guarantee; no overlay/difference heatmaps, evidence-grade tampering detection, image provenance certificates, or signed expiring download URLs yet.
+- OpenCV ORB detects some crops, rotations and rescalings in side-by-side comparison, but can produce false matches or misses. Not applied to every file in the local index. No evidence-grade tampering detection, image provenance certificates, or signed expiring download URLs yet.
 - No account multi-tenancy: APP_API_KEY is a **single-operator key**. Do not offer this as a public SaaS or share it with untrusted users.
 - Metadata may be absent or modified; image-derived conclusions do not prove original source or editing.
 - Malware scanning not integrated. Image decoding is restricted; deploy behind additional upload screening before public exposure.
 - For a continuous retention guarantee add a separate scheduled cleanup job; current cleanup runs when API endpoints are used.
 - SQLite is durable only on persistent disk; ephemeral free hosting can erase files/data.
-- Source provider adapters require legitimate access and separate integration; no scraping of restricted sites.
+- Additional source provider adapters require legitimate access and separate integration; no scraping of restricted sites.
+- Wikimedia Commons API requests comply with its published User-Agent policy. Queries may fail or be limited; the app marks provider failure distinctly from zero results.
 
 ## Local startup
 Requires Python 3.11+, Node 20+, Tesseract optional. From the project root:
@@ -57,3 +60,17 @@ Private operator API secret, no public upload endpoint, no biometric indexing, G
 
 ## Licensing
 The project does not copy InfoChecker code or reuse its branding. Evaluate third-party image and search provider licenses and terms before integration.
+
+## Live evaluation deployment (2026-11-19)
+
+- Frontend: https://imagetrace-osint-two.vercel.app (Vercel Hobby; may require Vercel authentication depending on deployment protection).
+- Backend: https://imagetrace-osint-api.onrender.com/api/health (Render Free; cold starts possible).
+- Branch for isolated deploys: `feat/imagetrace-osint-mvp`. Deployments were done without changing other apps.
+- A private `APP_API_KEY` is configured in Render. Retrieve it securely from the service environment settings before using the dashboard; it is not embedded in frontend bundles. Do not publish it.
+- **Render Free has ephemeral local disk**. Investigations and files are lost after a rebuild/restart; this is an evaluation instance, NOT durable production storage. Run locally with persistent disk or configure durable object storage and database before public release.
+- The backend does not serve the web homepage at `/`. Its health endpoint is `/api/health` and OpenAPI documentation is `/docs`.
+- This deploy is for one private operator only. The single shared API key does not isolate multiple accounts. Do not share the service or enable public registration until multi-user authentication, quotas, persistent storage, malware scanning, signed report downloads and review are complete.
+
+## Public provider provenance
+
+Wikimedia MediaWiki `list=allimages&aisha1` is an official query to detect exact file-byte matches. It does not perform face recognition, semantic similarity, or web-wide reverse search. Source: https://www.mediawiki.org/wiki/API:Allimages . User-Agent policy: https://www.mediawiki.org/wiki/Wikimedia_APIs/Access_policy .
