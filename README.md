@@ -2,6 +2,10 @@
 
 A privacy-conscious, local-first image investigation application: React + TypeScript + Vite frontend; FastAPI + Pillow + imagehash + SQLite backend. **Real local analysis, no mock web results, no facial identification.**
 
+## Reverse Image Search mode
+
+The **Reverse Search** tab uploads a permitted image to the private, single-operator index then compares up to the 100 most recent uploaded images by SHA-256, 64-bit pHash distance and (when hashes differ) OpenCV ORB geometric verification. Results explicitly distinguish verified byte-exact copies from non-conclusive visual similarities; no public URL is attributed to a private index item. Optionally check the file's SHA-1 in Wikimedia Commons, or follow manual links to external image search engines without uploading anything automatically. This does **not** find unidentified people from their faces, nor claim whole-internet coverage. Because Render Free uses ephemeral storage, an empty index or restarted instance can legitimately return no results.
+
 ## What works today
 - Validated JPG/PNG/WEBP uploads (max 10 MB, decompression-bomb protection, 35 MP limit).
 - SHA-256 exact-match detection; 64-bit perceptual pHash similarity comparison across the private uploaded index (distance ≤10; not a statistical confidence percentage).
