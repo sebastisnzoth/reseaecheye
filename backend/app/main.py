@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import base64
+import httpx
 import threading
 import sqlite3
 import time
@@ -47,6 +48,9 @@ def migrate():
             sha256 TEXT NOT NULL, phash TEXT NOT NULL, metadata TEXT NOT NULL,
             image_path TEXT NOT NULL)""")
         db.execute("CREATE INDEX IF NOT EXISTS idx_sha256 ON investigations(sha256)")
+        db.execute("""CREATE TABLE IF NOT EXISTS public_checks (
+           investigation_id TEXT PRIMARY KEY, checked_at TEXT NOT NULL,
+           status TEXT NOT NULL, results TEXT NOT NULL)""")
 
 migrate()
 
@@ -74,6 +78,7 @@ def cleanup():
         for row in rows:
             Path(row["image_path"]).unlink(missing_ok=True)
             db.execute("DELETE FROM investigations WHERE id=?", (row["id"],))
+            db.execute("DELETE FROM public_checks WHERE investigation_id=?", (row["id"],))
 
 def get_item(item_id):
     with connect() as db:
@@ -118,6 +123,13 @@ def serialize(row):
             "filename":row["filename"],"sha256":row["sha256"],"phash":row["phash"],
             "metadata":json.loads(row["metadata"])}
 
+def public_search_status(item_id):
+    with connect() as db:
+        row = db.execute("SELECT * FROM public_checks WHERE investigation_id=?", (item_id,)).fetchone()
+    return {"external_results":json.loads(row["results"]) if row else [],
+            "external_status":row["status"] if row else "not_checked",
+            "external_checked_at":row["checked_at"] if row else None}
+
 def matches(item):
     with connect() as db:
         rows = db.execute("SELECT * FROM investigations WHERE id != ? ORDER BY created_at DESC LIMIT 500", (item["id"],)).fetchall()
@@ -155,8 +167,8 @@ async def upload(file:UploadFile=File(...)):
         path.unlink(missing_ok=True)
         raise
     item = get_item(ident)
-    return {**serialize(item),"matches":matches(item),"external_results":[],
-            "external_status":"not_configured","limitations":["pHash may miss crops","No web-wide image index"]}
+    return {**serialize(item),"matches":matches(item),**public_search_status(ident),
+            "limitations":["pHash may miss crops","No web-wide image index"]}
 
 @app.get("/api/investigations",dependencies=[Depends(authorize)])
 def history():
@@ -169,7 +181,7 @@ def history():
 def detail(item_id:str):
     cleanup()
     row=get_item(item_id)
-    return {**serialize(row),"matches":matches(row),"external_results":[],"external_status":"not_configured"}
+    return {**serialize(row),"matches":matches(row),**public_search_status(item_id)}
 
 @app.get("/api/investigations/{item_id}/image",dependencies=[Depends(authorize)])
 def image_bytes(item_id:str):
@@ -180,9 +192,12 @@ def image_bytes(item_id:str):
 @app.get("/api/investigations/{item_id}/report.json",dependencies=[Depends(authorize)])
 def report_json(item_id:str):
     row=get_item(item_id)
-    payload={**serialize(row),"local_matches":matches(row),"public_web_matches":[],
-      "earliest_known_public_appearance":None,"external_provider_status":"not_configured",
-      "finding_status":"local_hashes_verified; public_sources_unknown",
+    lookup=public_search_status(item_id)
+    public_results=lookup["external_results"]
+    payload={**serialize(row),"local_matches":matches(row),"public_web_matches":public_results,
+      "earliest_known_public_appearance":None,"external_provider_status":lookup["external_status"],
+      "external_checked_at":lookup["external_checked_at"],
+      "finding_status":"local_hashes_verified; public provider exact SHA1 results when explicitly checked",
       "limitations":["Only user-uploaded private local index searched","No proof of manipulation or origin","No facial identification"]}
     return Response(json.dumps(payload,ensure_ascii=False,indent=2),media_type="application/json",
                     headers={"Content-Disposition":f'attachment; filename="imagetrace-{item_id}.json"',"Cache-Control":"no-store"})
@@ -194,11 +209,13 @@ def report_pdf(item_id:str):
     pdf.setTitle("ImageTrace OSINT - forensic report")
     pdf.setFont("Helvetica-Bold",16);pdf.drawString(48,790,"ImageTrace OSINT | Report")
     pdf.setFont("Helvetica",10)
+    public=public_search_status(item_id)
     lines=[f"ID: {info['id']}",f"Analyzed (UTC): {info['created_at']}",
            f"Filename: {info['filename'][:65]}",f"SHA-256: {info['sha256'][:50]}",f"       {info['sha256'][50:]}",
            f"pHash (64-bit): {info['phash']}",f"Dimensions: {info['metadata']['width']} x {info['metadata']['height']}",
            f"Local matching images: {len(matches(row))}",
-           "Public web search: NOT CONFIGURED; no matches asserted.",
+           f"Wikimedia Commons exact SHA1 matches: {len(public['external_results'])}",
+           f"External check status: {public['external_status']}",
            "Earliest known public appearance: UNKNOWN.",
            "Interpretation: hashes verify file equality; pHash is heuristic.",
            "Limitations: cannot prove original source or image manipulation.",
@@ -220,6 +237,7 @@ def delete(item_id:str):
     row=get_item(item_id)
     with connect() as db: db.execute("DELETE FROM investigations WHERE id=?",(item_id,))
     Path(row["image_path"]).unlink(missing_ok=True)
+    with connect() as db: db.execute("DELETE FROM public_checks WHERE investigation_id=?", (item_id,))
     return {"deleted":True,"id":item_id}
 
 @app.post("/api/compare",dependencies=[Depends(authorize)])
@@ -244,6 +262,51 @@ async def compare(first:UploadFile=File(...),second:UploadFile=File(...)):
             "phash":[p_a,p_b],"phash_distance":int(imagehash.hex_to_hash(p_a)-imagehash.hex_to_hash(p_b)),
             "dimensions":[[meta_a["width"],meta_a["height"]],[meta_b["width"],meta_b["height"]]],
             "note":"Hamming distance, not forensic proof; cropping may change hashes."}
+
+
+@app.post("/api/investigations/{item_id}/search/commons",dependencies=[Depends(authorize)])
+async def search_commons(item_id: str):
+    """Opt-in exact-file SHA1 search in Wikimedia Commons. Sends hash only, not image."""
+    cleanup()
+    row=get_item(item_id)
+    sha1=hashlib.sha1(Path(row["image_path"]).read_bytes()).hexdigest()
+    params={"action":"query","list":"allimages","aisha1":sha1,
+            "aiprop":"timestamp|url|sha1|size","format":"json","formatversion":"2","ailimit":"20"}
+    ua="ImageTraceOSINTBot/0.1 (https://github.com/sebastisnzoth/reseaecheye; research tool)"
+    try:
+        async with httpx.AsyncClient(timeout=8,follow_redirects=False,
+                                    headers={"User-Agent":ua,"Accept":"application/json"}) as client:
+            response=await client.get("https://commons.wikimedia.org/w/api.php",params=params)
+            response.raise_for_status()
+            data=response.json()
+        if "error" in data or not isinstance(data.get("query",{}).get("allimages"),list):
+            raise ValueError("Provider returned an unexpected response")
+    except (httpx.HTTPError,ValueError,TypeError) as exc:
+        # Provider failure is not an empty match.
+        return {"external_status":"provider_unavailable","external_results":[],
+                "detail":"Wikimedia Commons query failed or was rate limited; no result asserted"}
+    results=[]
+    for image in data["query"]["allimages"][:20]:
+        source=image.get("descriptionurl")
+        url=image.get("url")
+        if not isinstance(source,str) or not source.startswith("https://commons.wikimedia.org/"):
+            continue
+        if not isinstance(url,str) or not url.startswith("https://upload.wikimedia.org/"):
+            continue
+        results.append({"source":"Wikimedia Commons","domain":"commons.wikimedia.org",
+                        "title":str(image.get("title",""))[:220],
+                        "url":url,"page_url":source,
+                        "published_at":image.get("timestamp"),"date_type":"last_file_upload",
+                        "match_type":"exact_sha1","similarity":None,
+                        "verification":"provider_sha1_lookup","thumbnail":url})
+    checked_at=datetime.now(timezone.utc).isoformat()
+    with connect() as db:
+        db.execute("""INSERT INTO public_checks VALUES (?,?,?,?)
+            ON CONFLICT(investigation_id) DO UPDATE SET
+            checked_at=excluded.checked_at,status=excluded.status,results=excluded.results""",
+            (item_id,checked_at,"checked",json.dumps(results)))
+    return {"external_status":"checked","external_results":results,"external_checked_at":checked_at,
+            "scope":"Only current file versions in Wikimedia Commons; SHA1 exact bytes; not whole web"}
 
 @app.post("/api/analyze-url",dependencies=[Depends(authorize)])
 def analyze_url():

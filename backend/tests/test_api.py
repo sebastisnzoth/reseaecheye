@@ -48,3 +48,45 @@ def test_external_results_not_invented():
     r=add().json()
     assert r["external_results"]==[] and r["external_status"]=="not_configured"
     assert client.post("/api/analyze-url",headers=HEAD).status_code==501
+
+def test_public_search_failed_provider_not_fake(monkeypatch):
+    import httpx
+    from app import main
+    class ErrorClient:
+        def __init__(self,*args,**kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self,*args): pass
+        async def get(self,*args,**kwargs): raise httpx.ConnectError("unavailable")
+    monkeypatch.setattr(main.httpx,"AsyncClient",ErrorClient)
+    item=add().json()
+    result=client.post(f"/api/investigations/{item['id']}/search/commons",headers=HEAD)
+    assert result.status_code==200
+    assert result.json()["external_status"]=="provider_unavailable"
+    assert result.json()["external_results"]==[]
+
+def test_public_search_verified_response(monkeypatch):
+    from app import main
+    class Response:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"query":{"allimages":[{"title":"File:Example.png",
+            "url":"https://upload.wikimedia.org/wikipedia/commons/1/11/Example.png",
+            "descriptionurl":"https://commons.wikimedia.org/wiki/File:Example.png",
+            "timestamp":"2020-01-01T00:00:00Z"}]}}
+    class Client:
+        def __init__(self,*args,**kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self,*args): pass
+        async def get(self,url,params):
+            assert params["aisha1"]
+            assert url=="https://commons.wikimedia.org/w/api.php"
+            return Response()
+    monkeypatch.setattr(main.httpx,"AsyncClient",Client)
+    item=add().json()
+    result=client.post(f"/api/investigations/{item['id']}/search/commons",headers=HEAD)
+    assert result.status_code==200
+    assert result.json()["external_status"]=="checked"
+    assert len(result.json()["external_results"])==1
+    detail=client.get(f"/api/investigations/{item['id']}",headers=HEAD).json()
+    assert len(detail["external_results"])==1
+    client.delete(f"/api/investigations/{item['id']}",headers=HEAD)
