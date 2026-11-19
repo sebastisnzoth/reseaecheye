@@ -1,8 +1,39 @@
-backend/data/
-backend/.env
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node / frontend build
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+*.tsbuildinfo
+node_modules/
+
+# Runtime data and secrets (never commit)
+.env
+.env.local
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Paths used by the earlier local-first MVP (kept in docs/legacy-mvp/)
+backend/data/
+backend/.env
 **/__pycache__/
 **/.pytest_cache/
 *.pyc
-.DS_Store

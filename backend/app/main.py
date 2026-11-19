@@ -1,434 +1,556 @@
-"""ImageTrace OSINT: local image forensics; no face recognition or web scraping."""
-import hashlib
-import io
+"""FastAPI application: private API, signed assets and SPA hosting."""
+
+from __future__ import annotations
+
+import importlib.util
 import json
-import os
-import secrets
-import base64
-import httpx
+import re
+import shutil
 import threading
-import sqlite3
-import time
-import uuid
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlparse
-import ipaddress
-import socket
+from typing import Any
 
-import imagehash
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from PIL import Image, ImageOps, ImageChops, ImageEnhance, UnidentifiedImageError
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import simpleSplit
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-DATA = Path(os.getenv("DATA_DIR", "./data")).resolve()
-MAX_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "10485760"))
-RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "24"))
-ALLOWED_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
-DATA.mkdir(parents=True, exist_ok=True)
-DB = DATA / "imagetrace.sqlite3"
-_rate_lock = threading.Lock()
-_rate_window: dict[str, list[float]] = {}
+from . import __version__
+from .config import Settings
+from .db import utcnow
+from .providers.registry import provider_catalog
+from .reports import render_pdf
+from .security import (
+    ALLOWED_EXTENSIONS,
+    ValidationError,
+    client_ip,
+    fetch_public_image,
+    require_owner,
+    sanitize_image,
+    sign_resource,
+    verify_signature,
+)
+from .service import (
+    Runtime,
+    add_index_entry,
+    compare_with_upload,
+    create_investigation,
+    create_runtime,
+    delete_investigation,
+    detail,
+    investigation_dir,
+    purge_expired,
+    regenerate_report,
+)
 
-app = FastAPI(title="ImageTrace OSINT", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET","POST","DELETE"], allow_headers=["X-API-Key","Content-Type"])
+THUMB_NAME_RE = re.compile(r"^thumbs/[a-f0-9]{32}\.(jpg|png)$")
+LANGS = {"es", "pt", "en"}
 
-def connect():
-    db = sqlite3.connect(DB)
-    db.row_factory = sqlite3.Row
-    return db
 
-def migrate():
-    with connect() as db:
-        db.execute("""CREATE TABLE IF NOT EXISTS investigations (
-            id TEXT PRIMARY KEY, created_at REAL NOT NULL, filename TEXT NOT NULL,
-            sha256 TEXT NOT NULL, phash TEXT NOT NULL, metadata TEXT NOT NULL,
-            image_path TEXT NOT NULL)""")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_sha256 ON investigations(sha256)")
-        db.execute("""CREATE TABLE IF NOT EXISTS public_checks (
-           investigation_id TEXT PRIMARY KEY, checked_at TEXT NOT NULL,
-           status TEXT NOT NULL, results TEXT NOT NULL)""")
+class UrlRequest(BaseModel):
+    image_url: str = Field(min_length=8, max_length=2048)
+    keywords: str = Field(default="", max_length=500)
+    allow_gps: bool = False
+    allow_external: bool = True
+    retention_hours: int = Field(default=24, ge=1, le=168)
+    lang: str = "es"
 
-migrate()
 
-def authorize(request: Request, x_api_key: str | None = Header(default=None)):
-    key = os.getenv("APP_API_KEY", "")
-    # Fail closed until operator sets a secret; never expose results publicly.
-    if len(key) < 16:
-        raise HTTPException(503, "APP_API_KEY must be set (at least 16 characters)")
-    if not x_api_key or not secrets.compare_digest(key, x_api_key):
-        raise HTTPException(401, "Unauthorized")
-    if request.method == "POST":
-        now = time.monotonic()
-        identity = hashlib.sha256(x_api_key.encode()).hexdigest()
-        with _rate_lock:
-            history = [t for t in _rate_window.get(identity, []) if now-t < 60]
-            if len(history) >= 20:
-                raise HTTPException(429, "Too many processing requests; retry in one minute")
-            history.append(now)
-            _rate_window[identity] = history
+class SignedLinkRequest(BaseModel):
+    format: str = Field(default="pdf", pattern="^(pdf|json)$")
 
-def cleanup():
-    limit = time.time() - max(1, RETENTION_HOURS) * 3600
-    with connect() as db:
-        rows = db.execute("SELECT id,image_path FROM investigations WHERE created_at < ?", (limit,)).fetchall()
-        for row in rows:
-            Path(row["image_path"]).unlink(missing_ok=True)
-            db.execute("DELETE FROM investigations WHERE id=?", (row["id"],))
-            db.execute("DELETE FROM public_checks WHERE investigation_id=?", (row["id"],))
 
-def get_item(item_id):
-    with connect() as db:
-        row = db.execute("SELECT * FROM investigations WHERE id=?", (item_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Investigation not found")
-    return row
+def _clean_lang(raw: str | None) -> str:
+    value = (raw or "es").split("-")[0].lower()
+    return value if value in LANGS else "es"
 
-def analyze(data: bytes):
-    if len(data) > MAX_BYTES:
-        raise HTTPException(413, "File too large")
-    try:
-        img = Image.open(io.BytesIO(data))
-        if img.format not in ("JPEG", "PNG", "WEBP"):
-            raise HTTPException(415, "Only JPEG, PNG, WEBP supported")
-        if img.width * img.height > 35_000_000:
-            raise HTTPException(413, "Too many pixels")
-        exif = img.getexif()
-        # Return safe subset; GPS intentionally omitted from results.
-        fields = {271:"camera_make",272:"camera_model",306:"datetime",36867:"datetime_original",274:"orientation",305:"software"}
-        metadata = {name:str(exif[tag])[:200] for tag,name in fields.items() if tag in exif}
-        metadata.update({"width":img.width,"height":img.height,"format":img.format,"file_bytes":len(data),
-                         "gps_present":bool(exif.get(34853)), "gps_disclosed":False})
-        oriented = ImageOps.exif_transpose(img).convert("RGB")
-        p_hash = str(imagehash.phash(oriented))
-        # OCR is optional and never represented as complete or conclusive.
-        try:
-            import pytesseract
-            text = pytesseract.image_to_string(oriented, timeout=4).strip()[:2000]
-            metadata["ocr_text"] = text
-            metadata["ocr_status"] = "processed"
-        except Exception:
-            metadata["ocr_status"] = "unavailable"
-        return hashlib.sha256(data).hexdigest(), p_hash, metadata
-    except HTTPException:
-        raise
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
-        raise HTTPException(415, "Invalid or unsupported image")
 
-def serialize(row):
-    return {"id":row["id"],"created_at":datetime.fromtimestamp(row["created_at"],timezone.utc).isoformat(),
-            "filename":row["filename"],"sha256":row["sha256"],"phash":row["phash"],
-            "metadata":json.loads(row["metadata"])}
+def _asset_url(rt: Runtime, investigation_id: str, kind: str, name: str = "") -> str:
+    resource = f"asset:{investigation_id}:{kind}:{name}"
+    exp, sig = sign_resource(rt.settings.secret_key, resource, rt.settings.signed_url_ttl_seconds)
+    url = f"/api/assets/{investigation_id}/{kind}?exp={exp}&sig={sig}"
+    if name:
+        url += f"&name={name}"
+    return url
 
-def public_search_status(item_id):
-    with connect() as db:
-        row = db.execute("SELECT * FROM public_checks WHERE investigation_id=?", (item_id,)).fetchone()
-    return {"external_results":json.loads(row["results"]) if row else [],
-            "external_status":row["status"] if row else "not_checked",
-            "external_checked_at":row["checked_at"] if row else None}
 
-def matches(item):
-    with connect() as db:
-        rows = db.execute("SELECT * FROM investigations WHERE id != ? ORDER BY created_at DESC LIMIT 500", (item["id"],)).fetchall()
-    output = []
-    for row in rows:
-        distance = int(imagehash.hex_to_hash(item["phash"]) - imagehash.hex_to_hash(row["phash"]))
-        exact = row["sha256"] == item["sha256"]
-        if exact or distance <= 10:
-            output.append({"id":row["id"],"filename":row["filename"],"type":"exact" if exact else "visual_similarity",
-              "phash_distance":distance,"similarity_note":"Hamming distance of 64-bit pHash (0 is identical); not a probability",
-              "source":"private_local_index","verified":exact})
-    return sorted(output,key=lambda m:(not m["verified"],m["phash_distance"]))
+def _report_url(rt: Runtime, investigation_id: str, fmt: str) -> str:
+    resource = f"report:{investigation_id}:{fmt}"
+    exp, sig = sign_resource(rt.settings.secret_key, resource, rt.settings.signed_url_ttl_seconds)
+    return f"/api/downloads/{investigation_id}/{fmt}?exp={exp}&sig={sig}"
 
-@app.get("/api/health")
-def health():
-    return {"status":"ok","mode":"local_index","external_search":"not_configured"}
 
-@app.post("/api/analyze",dependencies=[Depends(authorize)])
-async def upload(file:UploadFile=File(...)):
-    cleanup()
-    if file.content_type not in ("image/jpeg","image/png","image/webp"):
-        raise HTTPException(415, "Invalid content type")
-    data = await file.read(MAX_BYTES+1)
-    if len(data)>MAX_BYTES: raise HTTPException(413, "File too large")
-    digest,phash,meta = analyze(data)
-    ident = str(uuid.uuid4())
-    path = DATA / (ident+".img")
-    path.write_bytes(data)
-    created = time.time()
-    try:
-        with connect() as db:
-            db.execute("INSERT INTO investigations VALUES (?,?,?,?,?,?,?)",
-                       (ident,created,Path(file.filename or "image").name[:120],digest,phash,json.dumps(meta),str(path)))
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
-    item = get_item(ident)
-    return {**serialize(item),"matches":matches(item),**public_search_status(ident),
-            "limitations":["pHash may miss crops","No web-wide image index"]}
+def _public_investigation(data: dict[str, Any]) -> dict[str, Any]:
+    for key in ("asset_original", "asset_display", "asset_diff", "report_pdf", "owner_hash"):
+        data.pop(key, None)
+    return data
 
-@app.get("/api/investigations",dependencies=[Depends(authorize)])
-def history():
-    cleanup()
-    with connect() as db:
-        rows=db.execute("SELECT * FROM investigations ORDER BY created_at DESC LIMIT 100").fetchall()
-    return [serialize(row) for row in rows]
 
-@app.get("/api/investigations/{item_id}",dependencies=[Depends(authorize)])
-def detail(item_id:str):
-    cleanup()
-    row=get_item(item_id)
-    return {**serialize(row),"matches":matches(row),**public_search_status(item_id)}
+def _owned_or_404(rt: Runtime, investigation_id: str, owner_hash: str) -> dict[str, Any]:
+    data = detail(rt, investigation_id, owner_hash)
+    if not data:
+        raise HTTPException(status_code=404, detail="Investigación no encontrada o no autorizada.")
+    return data
 
-@app.get("/api/investigations/{item_id}/image",dependencies=[Depends(authorize)])
-def image_bytes(item_id:str):
-    row=get_item(item_id)
-    return Response(Path(row["image_path"]).read_bytes(),media_type={"JPEG":"image/jpeg","PNG":"image/png","WEBP":"image/webp"}[json.loads(row["metadata"])["format"]],
-                    headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
 
-@app.get("/api/investigations/{item_id}/report.json",dependencies=[Depends(authorize)])
-def report_json(item_id:str):
-    row=get_item(item_id)
-    lookup=public_search_status(item_id)
-    public_results=lookup["external_results"]
-    payload={**serialize(row),"local_matches":matches(row),"public_web_matches":public_results,
-      "earliest_known_public_appearance":None,"external_provider_status":lookup["external_status"],
-      "external_checked_at":lookup["external_checked_at"],
-      "finding_status":"local_hashes_verified; public provider exact SHA1 results when explicitly checked",
-      "limitations":["Only user-uploaded private local index searched","No proof of manipulation or origin","No facial identification"]}
-    return Response(json.dumps(payload,ensure_ascii=False,indent=2),media_type="application/json",
-                    headers={"Content-Disposition":f'attachment; filename="imagetrace-{item_id}.json"',"Cache-Control":"no-store"})
+def _validate_upload(filename: str | None, data: bytes, settings: Settings):
+    return sanitize_image(data, filename or "", settings.max_upload_bytes)
 
-@app.get("/api/investigations/{item_id}/report.pdf",dependencies=[Depends(authorize)])
-def report_pdf(item_id:str):
-    row=get_item(item_id); info=serialize(row); buf=io.BytesIO()
-    pdf=canvas.Canvas(buf,pagesize=(595,842))
-    pdf.setTitle("ImageTrace OSINT - forensic report")
-    pdf.setFont("Helvetica-Bold",16);pdf.drawString(48,790,"ImageTrace OSINT | Report")
-    pdf.setFont("Helvetica",10)
-    public=public_search_status(item_id)
-    lines=[f"ID: {info['id']}",f"Analyzed (UTC): {info['created_at']}",
-           f"Filename: {info['filename'][:65]}",f"SHA-256: {info['sha256'][:50]}",f"       {info['sha256'][50:]}",
-           f"pHash (64-bit): {info['phash']}",f"Dimensions: {info['metadata']['width']} x {info['metadata']['height']}",
-           f"Local matching images: {len(matches(row))}",
-           f"Wikimedia Commons exact SHA1 matches: {len(public['external_results'])}",
-           f"External check status: {public['external_status']}",
-           "Earliest known public appearance: UNKNOWN.",
-           "Interpretation: hashes verify file equality; pHash is heuristic.",
-           "Limitations: cannot prove original source or image manipulation.",
-           "Privacy: no facial identification; GPS coordinates suppressed."]
-    y=765
-    for line in lines:
-        pdf.drawString(48,y,line);y-=23
-    try:
-        im=Image.open(row["image_path"]);im.thumbnail((440,310))
-        pdf.drawImage(ImageReader(im.convert("RGB")),48,110,width=im.width*min(440/im.width,300/im.height),
-                      height=im.height*min(440/im.width,300/im.height))
-    except Exception: pass
-    public_items=public["external_results"]
-    if public_items:
-        pdf.showPage()
-        pdf.setFont("Helvetica-Bold",15)
-        pdf.drawString(48,797,"Wikimedia Commons: exact SHA-1 file matches")
-        y=763
-        for i,match in enumerate(public_items,1):
-            if y < 115:
-                pdf.showPage();y=790
-            pdf.setFont("Helvetica-Bold",10)
-            for line in simpleSplit(f"{i}. {match.get('title','Untitled')}", "Helvetica-Bold",10,495):
-                pdf.drawString(48,y,line);y-=15
-            pdf.setFont("Helvetica",9)
-            for line in simpleSplit(f"Source: {match.get('page_url','')}", "Helvetica",9,490):
-                pdf.drawString(48,y,line);y-=14
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    cfg = settings or Settings.from_env()
+    rt = create_runtime(cfg)
+    stop_event = threading.Event()
+
+    def retention_loop() -> None:
+        while not stop_event.wait(900):
             try:
-                pdf.linkURL(match["page_url"],(48,y,545,y+32),relative=0)
-            except Exception: pass
-            pdf.drawString(48,y,f"Last uploaded: {match.get('published_at') or 'UNKNOWN'}; original appearance: UNKNOWN")
-            y-=34
-        if y < 90: pdf.showPage();y=790
-        pdf.setFont("Helvetica",9)
-        pdf.drawString(48,y,"Evidence: provider SHA-1 lookup; links require independent verification.")
-    pdf.showPage();pdf.save()
-    return Response(buf.getvalue(),media_type="application/pdf",
-        headers={"Content-Disposition":f'attachment; filename="imagetrace-{item_id}.pdf"',"Cache-Control":"no-store"})
-
-@app.delete("/api/investigations/{item_id}",dependencies=[Depends(authorize)])
-def delete(item_id:str):
-    row=get_item(item_id)
-    with connect() as db: db.execute("DELETE FROM investigations WHERE id=?",(item_id,))
-    Path(row["image_path"]).unlink(missing_ok=True)
-    with connect() as db: db.execute("DELETE FROM public_checks WHERE investigation_id=?", (item_id,))
-    return {"deleted":True,"id":item_id}
-
-@app.post("/api/compare",dependencies=[Depends(authorize)])
-async def compare(first:UploadFile=File(...),second:UploadFile=File(...)):
-    a=await first.read(MAX_BYTES+1);b=await second.read(MAX_BYTES+1)
-    sha_a,p_a,meta_a=analyze(a);sha_b,p_b,meta_b=analyze(b)
-    # Align dimensions for an orientative visual change map. Pixel ratio is not a tampering score.
-    ia=ImageOps.exif_transpose(Image.open(io.BytesIO(a))).convert("RGB")
-    ib=ImageOps.exif_transpose(Image.open(io.BytesIO(b))).convert("RGB")
-    size=(min(768,max(ia.width,ib.width)), min(768,max(ia.height,ib.height)))
-    ia=ImageOps.pad(ia,size,color=(0,0,0)); ib=ImageOps.pad(ib,size,color=(0,0,0))
-    diff=ImageChops.difference(ia,ib)
-    mask=diff.convert("L").point(lambda p: 255 if p > 30 else 0)
-    mask_pixels=mask.histogram()
-    altered=round(mask_pixels[255] / (size[0]*size[1]), 4)
-    tint=Image.new("RGB",size,(255,72,90))
-    heatmap=Image.composite(tint,ia,mask.point(lambda p: 125 if p else 0))
-    out=io.BytesIO();heatmap.save(out,format="PNG")
-    # ORB keypoints with geometric verification: robust to some crops/rotations/scales.
-    feature_matches=0;feature_inliers=0;possibly_same_scene=False
-    try:
-        import cv2
-        import numpy as np
-        gray_a=np.asarray(ImageOps.exif_transpose(Image.open(io.BytesIO(a))).convert("L"))
-        gray_b=np.asarray(ImageOps.exif_transpose(Image.open(io.BytesIO(b))).convert("L"))
-        orb=cv2.ORB_create(nfeatures=1400)
-        kp_a,desc_a=orb.detectAndCompute(gray_a,None)
-        kp_b,desc_b=orb.detectAndCompute(gray_b,None)
-        if desc_a is not None and desc_b is not None:
-            candidate=cv2.BFMatcher(cv2.NORM_HAMMING,crossCheck=True).match(desc_a,desc_b)
-            good=[m for m in candidate if m.distance < 58]
-            feature_matches=len(good)
-            if feature_matches >= 8:
-                src=np.float32([kp_a[m.queryIdx].pt for m in good]).reshape(-1,1,2)
-                dst=np.float32([kp_b[m.trainIdx].pt for m in good]).reshape(-1,1,2)
-                _,mask_h=cv2.findHomography(src,dst,cv2.RANSAC,5.0)
-                if mask_h is not None:
-                    feature_inliers=int(mask_h.sum())
-                    possibly_same_scene=feature_inliers>=10 and feature_inliers/max(feature_matches,1)>=0.45
-    except (ImportError,ValueError,cv2.error) if "cv2" in locals() else (ImportError,ValueError):
-        pass
-    return {"feature_matches":feature_matches,"feature_inliers":feature_inliers,
-            "possibly_same_scene":possibly_same_scene,
-            "feature_note":"ORB keypoint homography is an indicative visual match only; not identity or proof of editing",
-            "pixel_change_fraction":altered,"pixel_method":"absolute grayscale difference > 30/255 after aspect-preserving padding; sensitive to alignment/compression",
-            "difference_preview_png_base64":base64.b64encode(out.getvalue()).decode(),
-            "exact":sha_a==sha_b,"sha256":[sha_a,sha_b],
-            "phash":[p_a,p_b],"phash_distance":int(imagehash.hex_to_hash(p_a)-imagehash.hex_to_hash(p_b)),
-            "dimensions":[[meta_a["width"],meta_a["height"]],[meta_b["width"],meta_b["height"]]],
-            "note":"Hamming distance, not forensic proof; cropping may change hashes."}
-
-
-@app.post("/api/investigations/{item_id}/search/commons",dependencies=[Depends(authorize)])
-async def search_commons(item_id: str):
-    """Opt-in exact-file SHA1 search in Wikimedia Commons. Sends hash only, not image."""
-    cleanup()
-    row=get_item(item_id)
-    sha1=hashlib.sha1(Path(row["image_path"]).read_bytes()).hexdigest()
-    params={"action":"query","list":"allimages","aisha1":sha1,
-            "aiprop":"timestamp|url|sha1|size","format":"json","formatversion":"2","ailimit":"20"}
-    ua="ImageTraceOSINTBot/0.1 (https://github.com/sebastisnzoth/reseaecheye; research tool)"
-    try:
-        async with httpx.AsyncClient(timeout=8,follow_redirects=False,
-                                    headers={"User-Agent":ua,"Accept":"application/json"}) as client:
-            response=await client.get("https://commons.wikimedia.org/w/api.php",params=params)
-            response.raise_for_status()
-            data=response.json()
-        if "error" in data or not isinstance(data.get("query",{}).get("allimages"),list):
-            raise ValueError("Provider returned an unexpected response")
-    except (httpx.HTTPError,ValueError,TypeError) as exc:
-        # Provider failure is not an empty match.
-        return {"external_status":"provider_unavailable","external_results":[],
-                "detail":"Wikimedia Commons query failed or was rate limited; no result asserted"}
-    results=[]
-    for image in data["query"]["allimages"][:20]:
-        source=image.get("descriptionurl")
-        url=image.get("url")
-        if not isinstance(source,str) or not source.startswith("https://commons.wikimedia.org/"):
-            continue
-        if not isinstance(url,str) or not url.startswith("https://upload.wikimedia.org/"):
-            continue
-        results.append({"source":"Wikimedia Commons","domain":"commons.wikimedia.org",
-                        "title":str(image.get("title",""))[:220],
-                        "url":url,"page_url":source,
-                        "published_at":image.get("timestamp"),"date_type":"last_file_upload",
-                        "match_type":"exact_sha1","similarity":None,
-                        "verification":"provider_sha1_lookup","thumbnail":url})
-    checked_at=datetime.now(timezone.utc).isoformat()
-    with connect() as db:
-        db.execute("""INSERT INTO public_checks VALUES (?,?,?,?)
-            ON CONFLICT(investigation_id) DO UPDATE SET
-            checked_at=excluded.checked_at,status=excluded.status,results=excluded.results""",
-            (item_id,checked_at,"checked",json.dumps(results)))
-    return {"external_status":"checked","external_results":results,"external_checked_at":checked_at,
-            "scope":"Only current file versions in Wikimedia Commons; SHA1 exact bytes; not whole web"}
-
-
-@app.get("/api/investigations/{item_id}/reverse",dependencies=[Depends(authorize)])
-def reverse_search(item_id: str):
-    """Reverse search only the consenting operator's private upload index.
-    Exact SHA-256 or pHash similarity, plus ORB geometry for cropped/resized copies.
-    It is NOT an identity search and does not crawl other people's images.
-    """
-    cleanup()
-    item = get_item(item_id)
-    with connect() as db:
-        candidates = db.execute(
-          "SELECT * FROM investigations WHERE id != ? ORDER BY created_at DESC LIMIT 100",
-          (item_id,)).fetchall()
-    own_hash=imagehash.hex_to_hash(item["phash"])
-    query_features=None
-    try:
-        import cv2
-        import numpy as np
-        with Image.open(item["image_path"]) as im:
-            gray=np.asarray(ImageOps.exif_transpose(im).convert("L"))
-        detector=cv2.ORB_create(nfeatures=1200)
-        query_keypoints,query_features=detector.detectAndCompute(gray,None)
-    except (ImportError,OSError,ValueError):
-        query_features=None
-    found=[]
-    for candidate in candidates:
-        exact=item["sha256"]==candidate["sha256"]
-        distance=int(own_hash-imagehash.hex_to_hash(candidate["phash"]))
-        inliers=0
-        if not exact and distance>10 and query_features is not None:
-            try:
-                with Image.open(candidate["image_path"]) as im:
-                    candidate_gray=np.asarray(ImageOps.exif_transpose(im).convert("L"))
-                kp,desc=detector.detectAndCompute(candidate_gray,None)
-                if desc is not None:
-                    good=[m for m in cv2.BFMatcher(cv2.NORM_HAMMING,crossCheck=True).match(query_features,desc) if m.distance<58]
-                    if len(good)>=10:
-                        src=np.float32([query_keypoints[m.queryIdx].pt for m in good]).reshape(-1,1,2)
-                        dst=np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1,1,2)
-                        _,inlier_mask=cv2.findHomography(src,dst,cv2.RANSAC,5.0)
-                        if inlier_mask is not None:
-                            n=int(inlier_mask.sum())
-                            if n>=10 and n/len(good)>=0.45:inliers=n
-            except (OSError,ValueError,cv2.error):
+                purge_expired(rt)
+            except Exception:  # pragma: no cover - retention must never crash the app
                 pass
-        if exact or distance<=10 or inliers>=10:
-            found.append({
-                "id":candidate["id"],
-                "filename":candidate["filename"],
-                "created_at":datetime.fromtimestamp(candidate["created_at"],timezone.utc).isoformat(),
-                "match_type":"exact_bytes" if exact else "perceptual_similarity" if distance<=10 else "crop_or_scene_similarity",
-                "verified_exact":exact,
-                "phash_distance":distance,
-                "orb_inliers":inliers,
-                "source":"private_upload_index",
-                "source_url":None,
-                "explanation":"SHA-256 byte-identical" if exact else "64-bit pHash Hamming distance" if distance<=10 else "ORB geometric feature matching; not proof",
-            })
-    found.sort(key=lambda x:(not x["verified_exact"], x["match_type"]=="crop_or_scene_similarity", x["phash_distance"]))
-    return {"investigation_id":item_id,"matches":found,"searched_records":len(candidates),
-            "scope":"private_upload_index_only","no_public_identity_search":True,
-            "external":public_search_status(item_id),
-            "manual_providers":[
-                {"name":"Google Lens","url":"https://lens.google.com/","automatic_upload":False},
-                {"name":"TinEye","url":"https://tineye.com/","automatic_upload":False},
-                {"name":"Bing Visual Search","url":"https://www.bing.com/visualsearch","automatic_upload":False}
-            ],
-            "limitations":["No whole-web reverse index","Perceptual and ORB matches are not source verification",
-                          "Only up to 100 most recent local investigations searched"]}
 
-@app.post("/api/analyze-url",dependencies=[Depends(authorize)])
-def analyze_url():
-    # No SSRF surface until DNS pinning, size-bounded streaming and redirect rules are audited.
-    raise HTTPException(501,"Remote URL ingestion disabled until SSRF-safe fetcher is available")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):  # noqa: ARG001
+        try:
+            purge_expired(rt)
+        except Exception:
+            pass
+        worker = threading.Thread(target=retention_loop, name="imagetrace-retention", daemon=True)
+        worker.start()
+        yield
+        stop_event.set()
+        rt.executor.shutdown(wait=False, cancel_futures=True)
+
+    app = FastAPI(
+        title="ImageTrace OSINT",
+        version=__version__,
+        description="Análisis verificable de imágenes públicas. Sin resultados simulados.",
+        lifespan=lifespan,
+    )
+    app.state.runtime = rt
+    if cfg.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cfg.cors_origins,
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["X-Owner-Token", "Content-Type"],
+        )
+
+    @app.exception_handler(ValidationError)
+    async def validation_handler(_: Request, exc: ValidationError) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # ------------------------------------------------------------------ meta
+    @app.get("/api/health")
+    def health() -> dict[str, Any]:
+        return {"status": "ok", "version": __version__, "time": utcnow()}
+
+    @app.get("/api/config")
+    def config() -> dict[str, Any]:
+        return {
+            "name": "ImageTrace OSINT",
+            "version": __version__,
+            "languages": ["es", "pt", "en"],
+            "accepted_formats": sorted(ALLOWED_EXTENSIONS),
+            "max_upload_mb": cfg.max_upload_mb,
+            "max_url_download_mb": cfg.max_url_download_mb,
+            "retention_hours": cfg.retention_hours,
+            "rate_limit_per_minute": cfg.rate_limit_per_minute,
+            "signed_url_ttl_seconds": cfg.signed_url_ttl_seconds,
+            "external_providers_enabled": cfg.external_providers_enabled,
+            "providers": provider_catalog(),
+            "ocr": {
+                "tesseract": bool(shutil.which("tesseract") or cfg.tesseract_cmd),
+                "rapidocr": importlib.util.find_spec("rapidocr_onnxruntime") is not None,
+            },
+            "exiftool": bool(shutil.which("exiftool")),
+            "database": cfg.database_path.name,
+            "honesty_notice": (
+                "No existe búsqueda inversa automática de toda Internet. Los conectores externos "
+                "buscan candidatos por texto y los verifican localmente; el resto son enlaces manuales."
+            ),
+            "policy": {
+                "face_recognition": False,
+                "person_profiling": False,
+                "paid_apis": False,
+                "fabricated_results": False,
+            },
+        }
+
+    # ------------------------------------------------------------ investigate
+    @app.post("/api/investigations", status_code=201)
+    def upload_investigation(
+        request: Request,
+        file: UploadFile | None = File(default=None),
+        keywords: str = Form(default=""),
+        allow_gps: bool = Form(default=False),
+        allow_external: bool = Form(default=True),
+        retention_hours: int = Form(default=24),
+        lang: str = Form(default="es"),
+    ) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        rt.limiter.check(client_ip(request))
+        if file is None:
+            raise HTTPException(status_code=400, detail="Debe adjuntar un archivo de imagen.")
+        data = file.file.read(cfg.max_upload_bytes + 1)
+        try:
+            clean = _validate_upload(file.filename, data, cfg)
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _create(rt, owner, clean, "upload", None, file.filename, keywords, allow_gps, allow_external, retention_hours, lang)
+
+    @app.post("/api/investigations/url", status_code=201)
+    def url_investigation(body: UrlRequest, request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        rt.limiter.check(client_ip(request))
+        try:
+            data, final_url = fetch_public_image(body.image_url, cfg)
+            clean = _validate_upload(None, data, cfg)
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _create(
+            rt, owner, clean, "url", final_url, Path(final_url).name[:120], body.keywords,
+            body.allow_gps, body.allow_external, body.retention_hours, body.lang,
+        )
+
+    def _create(
+        runtime: Runtime,
+        owner: str,
+        clean: Any,
+        source_kind: str,
+        source_url: str | None,
+        filename: str | None,
+        keywords: str,
+        allow_gps: bool,
+        allow_external: bool,
+        retention_hours: int,
+        lang: str,
+    ) -> dict[str, Any]:
+        investigation_id = create_investigation(
+            runtime,
+            owner_hash=owner,
+            clean=clean,
+            source_kind=source_kind,
+            source_url=source_url,
+            original_filename=filename,
+            keywords=keywords,
+            allow_gps=bool(allow_gps),
+            allow_external=bool(allow_external),
+            retention_hours=max(1, min(168, int(retention_hours))),
+            lang=_clean_lang(lang),
+        )
+        return {
+            "id": investigation_id,
+            "status": "queued",
+            "progress_url": f"/api/investigations/{investigation_id}/status",
+            "detail_url": f"/api/investigations/{investigation_id}",
+        }
+
+    # ------------------------------------------------------------------ reads
+    @app.get("/api/investigations")
+    def history(request: Request, limit: int = 50) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        rows = rt.db.fetchall(
+            "SELECT id, created_at, status, stage, progress, sha256, width, height, original_filename, "
+            "source_url, lang, expires_at, error FROM investigations "
+            "WHERE owner_hash = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
+            (owner, max(1, min(200, limit))),
+        )
+        items = []
+        for row in rows:
+            item = dict(row)
+            counts = rt.db.fetchone(
+                "SELECT SUM(CASE WHEN evidence_level IN ('verified_exact','verified_visual') THEN 1 ELSE 0 END) AS verified, "
+                "COUNT(*) AS total FROM matches WHERE investigation_id = ?",
+                (row["id"],),
+            )
+            item["verified_matches"] = int(counts["verified"] or 0)
+            item["total_matches"] = int(counts["total"] or 0)
+            item["thumbnail_url"] = _asset_url(rt, row["id"], "display")
+            items.append(item)
+        return {"items": items, "count": len(items)}
+
+    @app.get("/api/investigations/{investigation_id}/status")
+    def status(investigation_id: str, request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        row = rt.db.fetchone(
+            "SELECT id, status, stage, progress, error, updated_at FROM investigations "
+            "WHERE id = ? AND owner_hash = ?",
+            (investigation_id, owner),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Investigación no encontrada o no autorizada.")
+        return dict(row)
+
+    @app.get("/api/investigations/{investigation_id}")
+    def investigation_detail(investigation_id: str, request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        data = _owned_or_404(rt, investigation_id, owner)
+        data["display_url"] = _asset_url(rt, investigation_id, "display")
+        if data.get("asset_diff"):
+            data["diff_url"] = _asset_url(rt, investigation_id, "diff")
+        data["report_urls"] = {
+            "json": f"/api/investigations/{investigation_id}/report/json",
+            "pdf": f"/api/investigations/{investigation_id}/report/pdf",
+        }
+        for match in data["matches"]:
+            name = match.get("local_thumbnail")
+            if name and THUMB_NAME_RE.match(name):
+                match["thumbnail_url_signed"] = _asset_url(rt, investigation_id, "thumb", name)
+        return {"investigation": _public_investigation(data)}
+
+    @app.delete("/api/investigations/{investigation_id}")
+    def remove_investigation(investigation_id: str, request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        if not delete_investigation(rt, investigation_id, owner):
+            raise HTTPException(status_code=404, detail="Investigación no encontrada o no autorizada.")
+        return {"deleted": True, "id": investigation_id}
+
+    # --------------------------------------------------------------- comparer
+    @app.post("/api/investigations/{investigation_id}/compare")
+    def compare(
+        investigation_id: str,
+        request: Request,
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        rt.limiter.check(client_ip(request))
+        _owned_or_404(rt, investigation_id, owner)
+        data = file.file.read(cfg.max_upload_bytes + 1)
+        try:
+            clean_b = _validate_upload(file.filename, data, cfg)
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        result = compare_with_upload(rt, investigation_id, clean_b)
+        result["diff_url"] = _asset_url(rt, investigation_id, "diff")
+        return result
+
+    # ---------------------------------------------------------------- reports
+    @app.get("/api/investigations/{investigation_id}/report/json")
+    def report_json(investigation_id: str, request: Request) -> Response:
+        _, owner = require_owner(request)
+        data = _owned_or_404(rt, investigation_id, owner)
+        report = data.get("report") or regenerate_report(rt, investigation_id)
+        return Response(
+            content=json.dumps(report, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="imagetrace-{investigation_id[:12]}.json"'},
+        )
+
+    @app.get("/api/investigations/{investigation_id}/report/pdf")
+    def report_pdf(investigation_id: str, request: Request) -> Response:
+        _, owner = require_owner(request)
+        data = _owned_or_404(rt, investigation_id, owner)
+        path = Path(data.get("report_pdf") or "")
+        if path.is_file():
+            return FileResponse(
+                path,
+                media_type="application/pdf",
+                filename=f"imagetrace-{investigation_id[:12]}.pdf",
+            )
+        report = data.get("report") or regenerate_report(rt, investigation_id)
+        return Response(
+            content=render_pdf(report),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="imagetrace-{investigation_id[:12]}.pdf"'},
+        )
+
+    @app.post("/api/investigations/{investigation_id}/signed-link")
+    def signed_link(investigation_id: str, body: SignedLinkRequest, request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        _owned_or_404(rt, investigation_id, owner)
+        return {
+            "url": _report_url(rt, investigation_id, body.format),
+            "expires_in_seconds": cfg.signed_url_ttl_seconds,
+            "note": "La URL contiene solo una firma HMAC con vencimiento; el token de propietario nunca viaja en la URL.",
+        }
+
+    @app.get("/api/downloads/{investigation_id}/{fmt}")
+    def signed_download(
+        investigation_id: str, fmt: str, request: Request, exp: int = 0, sig: str = ""
+    ) -> Response:
+        if fmt not in {"pdf", "json"}:
+            raise HTTPException(status_code=400, detail="Formato no soportado.")
+        resource = f"report:{investigation_id}:{fmt}"
+        if not verify_signature(cfg.secret_key, resource, exp, sig):
+            raise HTTPException(status_code=403, detail="Firma inválida o vencida.")
+        row = rt.db.fetchone("SELECT report_json, report_pdf FROM investigations WHERE id = ?", (investigation_id,))
+        if not row:
+            raise HTTPException(status_code=404, detail="Informe no disponible.")
+        if fmt == "json":
+            content = row["report_json"] or "{}"
+            return Response(
+                content=content.encode("utf-8"),
+                media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="imagetrace-{investigation_id[:12]}.json"'},
+            )
+        path = Path(row["report_pdf"] or "")
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="PDF no generado todavía.")
+        return FileResponse(path, media_type="application/pdf", filename=f"imagetrace-{investigation_id[:12]}.pdf")
+
+    # ----------------------------------------------------------------- assets
+    @app.get("/api/assets/{investigation_id}/{kind}")
+    def asset(
+        investigation_id: str,
+        kind: str,
+        request: Request,
+        exp: int = 0,
+        sig: str = "",
+        name: str = "",
+    ) -> Response:
+        if kind not in {"display", "thumb", "diff"}:
+            raise HTTPException(status_code=404, detail="Recurso no soportado.")
+        if kind == "thumb" and not THUMB_NAME_RE.match(name):
+            raise HTTPException(status_code=400, detail="Nombre de miniatura inválido.")
+        resource = f"asset:{investigation_id}:{kind}:{name}"
+        if not verify_signature(cfg.secret_key, resource, exp, sig):
+            raise HTTPException(status_code=403, detail="Firma inválida o vencida.")
+        row = rt.db.fetchone(
+            "SELECT asset_display, asset_diff FROM investigations WHERE id = ?", (investigation_id,)
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Recurso no encontrado.")
+        directory = investigation_dir(rt, investigation_id)
+        if kind == "display":
+            path = Path(row["asset_display"] or "")
+            media = "image/png" if path.suffix == ".png" else "image/jpeg"
+        elif kind == "diff":
+            path = Path(row["asset_diff"] or "")
+            media = "image/png"
+        else:
+            path = directory / name
+            media = "image/png" if path.suffix == ".png" else "image/jpeg"
+        try:
+            resolved = path.resolve()
+            if directory.resolve() not in resolved.parents or not resolved.is_file():
+                raise HTTPException(status_code=404, detail="Recurso no encontrado.")
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="Recurso no encontrado.") from exc
+        headers = {
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
+        }
+        return FileResponse(resolved, media_type=media, headers=headers)
+
+    # ------------------------------------------------------------ local index
+    @app.post("/api/index", status_code=201)
+    def add_index(
+        request: Request,
+        file: UploadFile | None = File(default=None),
+        image_url: str | None = Form(default=None),
+        label: str = Form(default="Imagen permitida"),
+        retention_hours: int = Form(default=24),
+    ) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        rt.limiter.check(client_ip(request))
+        if file is not None:
+            data = file.file.read(cfg.max_upload_bytes + 1)
+            clean = _validate_upload(file.filename, data, cfg)
+            source = None
+            filename = file.filename
+        elif image_url:
+            try:
+                data, final_url = fetch_public_image(image_url, cfg)
+                clean = _validate_upload(None, data, cfg)
+                source = final_url
+                filename = Path(final_url).name[:120]
+            except ValidationError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            raise HTTPException(status_code=400, detail="Adjunte una imagen o una URL pública.")
+        entry_id = add_index_entry(
+            rt, owner, clean, label or filename or "Imagen permitida", source,
+            max(1, min(168, int(retention_hours))),
+        )
+        return {"id": entry_id, "detail": "Imagen agregada al índice privado permitido por el usuario."}
+
+    @app.get("/api/index")
+    def list_index(request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        rows = rt.db.fetchall(
+            "SELECT id, sha256, phash, width, height, label, source_url, created_at, expires_at "
+            "FROM index_entries WHERE owner_hash = ? ORDER BY created_at DESC LIMIT 200",
+            (owner,),
+        )
+        return {"items": [dict(r) for r in rows], "count": len(rows)}
+
+    @app.delete("/api/index/{entry_id}")
+    def delete_index(entry_id: str, request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        row = rt.db.fetchone(
+            "SELECT asset_path FROM index_entries WHERE id = ? AND owner_hash = ?", (entry_id, owner)
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Entrada no encontrada.")
+        path = Path(row["asset_path"] or "")
+        rt.db.execute("DELETE FROM index_entries WHERE id = ?", (entry_id,))
+        if path.is_absolute() and path.is_file() and cfg.data_dir in path.parents:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        rt.db.audit(owner, "delete_index_entry", entry_id)
+        return {"deleted": True, "id": entry_id}
+
+    # ---------------------------------------------------------------- privacy
+    @app.post("/api/privacy/purge")
+    def purge(request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        rt.db.audit(owner, "purge_expired")
+        return {"removed": purge_expired(rt), "note": "Se eliminaron archivos e investigaciones vencidos según la política de retención."}
+
+    @app.delete("/api/privacy/all")
+    def delete_all(request: Request) -> dict[str, Any]:
+        _, owner = require_owner(request)
+        rows = rt.db.fetchall(
+            "SELECT id FROM investigations WHERE owner_hash = ?", (owner,)
+        )
+        for row in rows:
+            delete_investigation(rt, row["id"], owner)
+        index_rows = rt.db.fetchall(
+            "SELECT id, asset_path FROM index_entries WHERE owner_hash = ?", (owner,)
+        )
+        for entry in index_rows:
+            path = Path(entry["asset_path"] or "")
+            if path.is_absolute() and path.is_file() and cfg.data_dir in path.parents:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            rt.db.execute("DELETE FROM index_entries WHERE id = ?", (entry["id"],))
+        rt.db.audit(owner, "delete_all_data")
+        return {"deleted_investigations": len(rows), "deleted_index_entries": len(index_rows)}
+
+    # -------------------------------------------------------------------- SPA
+    dist = cfg.frontend_dist
+    if (dist / "index.html").is_file():
+        assets_dir = dist / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="frontend-assets")
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        def spa(full_path: str) -> Response:  # noqa: ARG001
+            if full_path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="Endpoint no encontrado.")
+            candidate = (dist / full_path).resolve()
+            if dist.resolve() in candidate.parents and candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(dist / "index.html", media_type="text/html", headers={"Cache-Control": "no-cache"})
+    else:
+        @app.get("/", include_in_schema=False)
+        def no_frontend() -> HTMLResponse:
+            return HTMLResponse(
+                "<h1>ImageTrace OSINT API</h1><p>Backend operativo. "
+                "Construya el frontend con <code>npm run build</code> o use <code>npm run dev</code> "
+                "(proxy /api). Documentación: <a href='/docs'>/docs</a>.</p>",
+                status_code=200,
+            )
+
+    return app
+
+
+app = create_app()

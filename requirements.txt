@@ -1,0 +1,29 @@
+# ImageTrace OSINT — backend runtime dependencies (all open source / free).
+# Python 3.10+ recommended. Install with: pip install -r requirements.txt
+# Then run scripts/fix-opencv.sh (see README) to keep the headless OpenCV build.
+
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.20
+pydantic>=2.0
+httpx>=0.27
+
+Pillow>=10.0
+numpy>=1.24
+imagehash>=4.3
+opencv-python-headless>=4.8
+
+# OCR: Tesseract is optional (requires the system binary); RapidOCR/ONNX is the
+# pure-Python fallback so OCR works on hosts without apt packages.
+pytesseract>=0.3.10
+rapidocr-onnxruntime>=1.3
+
+# PDF reports
+reportlab>=4.0
+
+# Tests
+pytest>=8.0
+
+# Optional system binaries (NOT pip packages):
+#   tesseract-ocr    -> enables Tesseract instead of RapidOCR
+#   libimage-exiftool-perl / exiftool -> richer EXIF extraction
