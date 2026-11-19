@@ -358,6 +358,76 @@ async def search_commons(item_id: str):
     return {"external_status":"checked","external_results":results,"external_checked_at":checked_at,
             "scope":"Only current file versions in Wikimedia Commons; SHA1 exact bytes; not whole web"}
 
+
+@app.get("/api/investigations/{item_id}/reverse",dependencies=[Depends(authorize)])
+def reverse_search(item_id: str):
+    """Reverse search only the consenting operator's private upload index.
+    Exact SHA-256 or pHash similarity, plus ORB geometry for cropped/resized copies.
+    It is NOT an identity search and does not crawl other people's images.
+    """
+    cleanup()
+    item = get_item(item_id)
+    with connect() as db:
+        candidates = db.execute(
+          "SELECT * FROM investigations WHERE id != ? ORDER BY created_at DESC LIMIT 100",
+          (item_id,)).fetchall()
+    own_hash=imagehash.hex_to_hash(item["phash"])
+    query_features=None
+    try:
+        import cv2
+        import numpy as np
+        with Image.open(item["image_path"]) as im:
+            gray=np.asarray(ImageOps.exif_transpose(im).convert("L"))
+        detector=cv2.ORB_create(nfeatures=1200)
+        query_keypoints,query_features=detector.detectAndCompute(gray,None)
+    except (ImportError,OSError,ValueError):
+        query_features=None
+    found=[]
+    for candidate in candidates:
+        exact=item["sha256"]==candidate["sha256"]
+        distance=int(own_hash-imagehash.hex_to_hash(candidate["phash"]))
+        inliers=0
+        if not exact and distance>10 and query_features is not None:
+            try:
+                with Image.open(candidate["image_path"]) as im:
+                    candidate_gray=np.asarray(ImageOps.exif_transpose(im).convert("L"))
+                kp,desc=detector.detectAndCompute(candidate_gray,None)
+                if desc is not None:
+                    good=[m for m in cv2.BFMatcher(cv2.NORM_HAMMING,crossCheck=True).match(query_features,desc) if m.distance<58]
+                    if len(good)>=10:
+                        src=np.float32([query_keypoints[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+                        dst=np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+                        _,inlier_mask=cv2.findHomography(src,dst,cv2.RANSAC,5.0)
+                        if inlier_mask is not None:
+                            n=int(inlier_mask.sum())
+                            if n>=10 and n/len(good)>=0.45:inliers=n
+            except (OSError,ValueError,cv2.error):
+                pass
+        if exact or distance<=10 or inliers>=10:
+            found.append({
+                "id":candidate["id"],
+                "filename":candidate["filename"],
+                "created_at":datetime.fromtimestamp(candidate["created_at"],timezone.utc).isoformat(),
+                "match_type":"exact_bytes" if exact else "perceptual_similarity" if distance<=10 else "crop_or_scene_similarity",
+                "verified_exact":exact,
+                "phash_distance":distance,
+                "orb_inliers":inliers,
+                "source":"private_upload_index",
+                "source_url":None,
+                "explanation":"SHA-256 byte-identical" if exact else "64-bit pHash Hamming distance" if distance<=10 else "ORB geometric feature matching; not proof",
+            })
+    found.sort(key=lambda x:(not x["verified_exact"], x["match_type"]=="crop_or_scene_similarity", x["phash_distance"]))
+    return {"investigation_id":item_id,"matches":found,"searched_records":len(candidates),
+            "scope":"private_upload_index_only","no_public_identity_search":True,
+            "external":public_search_status(item_id),
+            "manual_providers":[
+                {"name":"Google Lens","url":"https://lens.google.com/","automatic_upload":False},
+                {"name":"TinEye","url":"https://tineye.com/","automatic_upload":False},
+                {"name":"Bing Visual Search","url":"https://www.bing.com/visualsearch","automatic_upload":False}
+            ],
+            "limitations":["No whole-web reverse index","Perceptual and ORB matches are not source verification",
+                          "Only up to 100 most recent local investigations searched"]}
+
 @app.post("/api/analyze-url",dependencies=[Depends(authorize)])
 def analyze_url():
     # No SSRF surface until DNS pinning, size-bounded streaming and redirect rules are audited.
